@@ -19,9 +19,9 @@ const bucketSizeBits = 40
 
 const genSizeBits = 64 - bucketSizeBits
 
-const maxGen = 1<<genSizeBits - 1
+const maxGen = 1<<genSizeBits - 1 // 2^24 - 1
 
-const maxBucketSize uint64 = 1 << bucketSizeBits
+const maxBucketSize uint64 = 1 << bucketSizeBits // 2^40
 
 // Stats represents cache stats.
 //
@@ -66,6 +66,7 @@ func (s *Stats) Reset() {
 }
 
 // BigStats contains stats for GetBig/SetBig methods.
+// 记录了 一些  Cache 方法统计信息
 type BigStats struct {
 	// GetBigCalls is the number of GetBig calls.
 	GetBigCalls uint64
@@ -109,7 +110,7 @@ func (bs *BigStats) reset() {
 // Call Reset when the cache is no longer needed. This reclaims the allocated
 // memory.
 type Cache struct {
-	buckets [bucketsCount]bucket
+	buckets [bucketsCount]bucket // bucketCount default 512
 
 	bigStats BigStats
 }
@@ -125,6 +126,7 @@ func New(maxBytes int) *Cache {
 		panic(fmt.Errorf("maxBytes must be greater than 0; got %d", maxBytes))
 	}
 	var c Cache
+	// 如果 maxByte / bucketCount 有余数的话, 把超出的部分 分填到 每一个 bucket --向上取整
 	maxBucketBytes := uint64((maxBytes + bucketsCount - 1) / bucketsCount)
 	for i := range c.buckets[:] {
 		c.buckets[i].Init(maxBucketBytes)
@@ -147,7 +149,7 @@ func New(maxBytes int) *Cache {
 // k and v contents may be modified after returning from Set.
 func (c *Cache) Set(k, v []byte) {
 	h := xxhash.Sum64(k)
-	idx := h % bucketsCount
+	idx := h % bucketsCount // 这里 可以 使用  位运算:  h & (bucketsCount - 1)
 	c.buckets[idx].Set(k, v, h)
 }
 
@@ -214,22 +216,27 @@ func (c *Cache) UpdateStats(s *Stats) {
 	s.InvalidValueHashErrors += atomic.LoadUint64(&c.bigStats.InvalidValueHashErrors)
 }
 
+// 一个 bucket
 type bucket struct {
 	mu sync.RWMutex
 
 	// chunks is a ring buffer with encoded (k, v) pairs.
 	// It consists of 64KB chunks.
+	// 每个 块是64K, 也就是 chunkSize
 	chunks [][]byte
 
 	// m maps hash(k) to idx of (k, v) pair in chunks.
+	// key: hash(key) value:  idx, value 在 chunk中的偏移量(byte) (b.gen << bucketSizeBits | idx) => 可以计算出偏移量 offset
 	m map[uint64]uint64
 
 	// idx points to chunks for writing the next (k, v) pair.
-	idx uint64
+	// 用于计算下一个chunk
+	idx uint64 // 下一次 要写入的 位置
 
 	// gen is the generation of chunks.
-	gen uint64
+	gen uint64 // 由于 b.chunks 是一个ringBuf, gen 记录 chunks 的循环使用次数 24bit: gen  40bit: idx
 
+	// 一些统计信息
 	getCalls    uint64
 	setCalls    uint64
 	misses      uint64
@@ -244,6 +251,7 @@ func (b *bucket) Init(maxBytes uint64) {
 	if maxBytes >= maxBucketSize {
 		panic(fmt.Errorf("too big maxBytes=%d; should be smaller than %d", maxBytes, maxBucketSize))
 	}
+	// 同样的,  需要的 chunk数  -- 相当于向上取整
 	maxChunks := (maxBytes + chunkSize - 1) / chunkSize
 	b.chunks = make([][]byte, maxChunks)
 	b.m = make(map[uint64]uint64)
@@ -273,9 +281,17 @@ func (b *bucket) cleanLocked() {
 	bIdx := b.idx
 	bm := b.m
 	for k, v := range bm {
+		// 取出 当前 key对应的 kv  的 gen & idx
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
-		if (gen+1 == bGen || gen == maxGen && bGen == 1) && idx >= bIdx || gen == bGen && idx < bIdx {
+		// 下面两种场景,不需要清理
+		// 1. 上一代数据 不需要清理
+		// 	idx >= bIdx && gen+1 == bGen
+		// 	idx >= bIdx && gen == maxGen && bGen == 1
+		// 2. 本代数据, idx < bIdx 不需要清理.
+		// 	idx < bIdx  && gen == bGen
+		if ((gen+1 == bGen || (gen == maxGen && bGen == 1)) && idx >= bIdx) ||
+			(gen == bGen && idx < bIdx) {
 			continue
 		}
 		delete(bm, k)
@@ -300,6 +316,8 @@ func (b *bucket) UpdateStats(s *Stats) {
 	b.mu.RUnlock()
 }
 
+// 2byte | 2byte | nbyte
+// keylen|valLen|kv
 func (b *bucket) Set(k, v []byte, h uint64) {
 	atomic.AddUint64(&b.setCalls, 1)
 	if len(k) >= (1<<16) || len(v) >= (1<<16) {
@@ -307,18 +325,25 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 		// with 2 bytes (see below). Skip the entry.
 		return
 	}
+	// 大端存储
 	var kvLenBuf [4]byte
 	kvLenBuf[0] = byte(uint16(len(k)) >> 8)
 	kvLenBuf[1] = byte(len(k))
 	kvLenBuf[2] = byte(uint16(len(v)) >> 8)
 	kvLenBuf[3] = byte(len(v))
-	kvLen := uint64(len(kvLenBuf) + len(k) + len(v))
+	kvLen := uint64(len(kvLenBuf) + len(k) + len(v)) // 要写入的数据的长度
 	if kvLen >= chunkSize {
 		// Do not store too big keys and values, since they do not
 		// fit a chunk.
 		return
 	}
 
+	// chunk
+	// chunkIdx:  chunk
+	// 0:[000000000000000000]  // 64K
+	// 1:[000000000000000000]
+	// 2:[000000000000000000]
+	// 3:[000000000000000000]
 	chunks := b.chunks
 	needClean := false
 	b.mu.Lock()
@@ -326,35 +351,38 @@ func (b *bucket) Set(k, v []byte, h uint64) {
 	idxNew := idx + kvLen
 	chunkIdx := idx / chunkSize
 	chunkIdxNew := idxNew / chunkSize
-	if chunkIdxNew > chunkIdx {
-		if chunkIdxNew >= uint64(len(chunks)) {
+	if chunkIdxNew > chunkIdx { //当前 chunk 放不下 该 kv, 往下一个 chunk 写 或者 循环写
+		if chunkIdxNew >= uint64(len(chunks)) { // 循环写
 			idx = 0
 			idxNew = kvLen
 			chunkIdx = 0
-			b.gen++
-			if b.gen&((1<<genSizeBits)-1) == 0 {
-				b.gen++
+			b.gen++                              // 循环次数
+			if b.gen&((1<<genSizeBits)-1) == 0 { // b.gen&maxGen == 0, 说明 b.gen == maxGen() 溢出, 重新计数 b.gen= 1
+				b.gen++ // 此处 ++ 的目的是为了 循环取余
 			}
-			needClean = true
-		} else {
+			needClean = true // 当 chunks 满了, 需要 从 头chunks[0]开始写, 需要把当前 chunk 全部清空.(清空  b.m)
+		} else { // 大部分场景
 			idx = chunkIdxNew * chunkSize
 			idxNew = idx + kvLen
 			chunkIdx = chunkIdxNew
 		}
-		chunks[chunkIdx] = chunks[chunkIdx][:0]
+		chunks[chunkIdx] = chunks[chunkIdx][:0] // 将该chunk清空
 	}
 	chunk := chunks[chunkIdx]
+	// 首次初始化 , chunk[i] == nil
 	if chunk == nil {
-		chunk = getChunk()
+		chunk = getChunk() // 性能关键点: 堆外分配内存
 		chunk = chunk[:0]
 	}
+	// 正式写入数据
 	chunk = append(chunk, kvLenBuf[:]...)
 	chunk = append(chunk, k...)
 	chunk = append(chunk, v...)
 	chunks[chunkIdx] = chunk
-	b.m[h] = idx | (b.gen << bucketSizeBits)
+	b.m[h] = idx | (b.gen << bucketSizeBits) // gen + idx
 	b.idx = idxNew
-	if needClean {
+	if needClean { // 该 chunk 原来有数据, 需要被覆盖
+		// 清理 覆盖的  overflow 的 chunk(遍历 b.m,逐个 判断 清理)
 		b.cleanLocked()
 	}
 	b.mu.Unlock()
@@ -365,15 +393,19 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 	found := false
 	chunks := b.chunks
 	b.mu.RLock()
-	v := b.m[h]
-	bGen := b.gen & ((1 << genSizeBits) - 1)
+	v := b.m[h]                              // 读取 value， 从中解析出  idx = v & ((1 << bucketSizeBits) - 1)  & gen = v >> bucketSizeBits
+	bGen := b.gen & ((1 << genSizeBits) - 1) // 当前 bucket处于第几代: bGen
 	if v > 0 {
 		gen := v >> bucketSizeBits
 		idx := v & ((1 << bucketSizeBits) - 1)
+		// gen == bGen && idx < b.idx: 在一个循环内
+		// gen+1 == bGen && idx >= b.idx: 不在一个循环内,数据没有覆盖
+		// gen == maxGen && bGen == 1 && idx >= b.idx: 重新开始循环,数据没有覆盖
 		if gen == bGen && idx < b.idx || gen+1 == bGen && idx >= b.idx || gen == maxGen && bGen == 1 && idx >= b.idx {
 			chunkIdx := idx / chunkSize
 			if chunkIdx >= uint64(len(chunks)) {
 				// Corrupted data during the load from file. Just skip it.
+				// 文件加载时损坏的数据,跳过
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
@@ -381,6 +413,7 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 			idx %= chunkSize
 			if idx+4 >= chunkSize {
 				// Corrupted data during the load from file. Just skip it.
+				// 文件加载时损坏的数据,跳过
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
@@ -388,18 +421,22 @@ func (b *bucket) Get(dst, k []byte, h uint64, returnDst bool) ([]byte, bool) {
 			keyLen := (uint64(kvLenBuf[0]) << 8) | uint64(kvLenBuf[1])
 			valLen := (uint64(kvLenBuf[2]) << 8) | uint64(kvLenBuf[3])
 			idx += 4
+			// 文件加载时损坏的数据,跳过
 			if idx+keyLen+valLen >= chunkSize {
 				// Corrupted data during the load from file. Just skip it.
 				atomic.AddUint64(&b.corruptions, 1)
 				goto end
 			}
+			// hash 值相同, 判断 key 是否一致
 			if string(k) == string(chunk[idx:idx+keyLen]) {
+				// dst = chunk[idx+keyLen:idx+valLen]
 				idx += keyLen
 				if returnDst {
 					dst = append(dst, chunk[idx:idx+valLen]...)
 				}
 				found = true
 			} else {
+				// 发生hash collision
 				atomic.AddUint64(&b.collisions, 1)
 			}
 		}

@@ -69,6 +69,7 @@ func (c *Cache) SaveToFileConcurrent(filePath string, concurrency int) error {
 	if err := os.RemoveAll(filePath); err != nil {
 		return fmt.Errorf("cannot remove old contents at %q: %s", filePath, err)
 	}
+	// 重命名
 	if err := os.Rename(tmpDir, filePath); err != nil {
 		return fmt.Errorf("cannot move temporary dir %q to %q: %s", tmpDir, filePath, err)
 	}
@@ -119,7 +120,7 @@ func (c *Cache) save(dir string, workersCount int) error {
 	for i := 0; i < workersCount; i++ {
 		result := <-results
 		if result != nil && err == nil {
-			err = result
+			err = result //这里可以提前 break ?
 		}
 	}
 	return err
@@ -271,6 +272,7 @@ func loadBuckets(buckets []bucket, dataPath string, maxChunks uint64) error {
 	}
 }
 
+// 将内存中数据写入  io.Writer(文件,网络...)
 func (b *bucket) Save(w io.Writer) error {
 	b.mu.Lock()
 	b.cleanLocked()
@@ -326,6 +328,7 @@ func (b *bucket) Save(w io.Writer) error {
 	return nil
 }
 
+// 从 io.Writer 加载缓存数据
 func (b *bucket) Load(r io.Reader, maxChunks uint64) error {
 	if maxChunks == 0 {
 		return fmt.Errorf("the number of chunks per bucket cannot be zero")
@@ -376,7 +379,8 @@ func (b *bucket) Load(r io.Reader, maxChunks uint64) error {
 		chunk := getChunk()
 		chunks[chunkIdx] = chunk
 		if _, err := io.ReadFull(r, chunk); err != nil {
-			// Free up allocated chunks before returning the error.
+			// free up allocated chunks before returning the error.
+			// 返回 错误之前 释放掉 分配的 chunk
 			for _, chunk := range chunks {
 				if chunk != nil {
 					putChunk(chunk)
